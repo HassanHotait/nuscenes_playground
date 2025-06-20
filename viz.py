@@ -9,6 +9,8 @@ import matplotlib
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
+from dataset import NuScenesMod
+from utils import filter_depth_by_radar_model
 from nuscenes import nuscenes
 
 # from .download_dataset import MINISPLIT_SCENES, download_minisplit
@@ -25,6 +27,7 @@ The full source code for this example is available
 
 EXAMPLE_DIR: Final = pathlib.Path(__file__).parent.parent
 DATASET_DIR: Final = pathlib.Path("/work3/s203211/datasets/nuscenes")
+RENDER_DIR: Final = pathlib.Path("/work3/s203211/datasets/nuscenes/unnamed/neurad/2025-06-13_183130/render")
 # currently need to calculate the color manually
 # see https://github.com/rerun-io/rerun/issues/4409
 cmap = matplotlib.colormaps["turbo_r"]
@@ -43,11 +46,11 @@ def ensure_scene_available(root_dir: pathlib.Path, dataset_version: str, scene_n
     Raises ValueError if scene is not available and cannot be downloaded.
     """
     try:
-        nusc = nuscenes.NuScenes(version=dataset_version, dataroot=root_dir, verbose=True)
+        nusc = NuScenesMod(version=dataset_version, dataroot=root_dir, verbose=True)
     except AssertionError:  # dataset initialization failed
         if dataset_version == "v1.0-trainval":
             # download_minisplit(root_dir)
-            nusc = nuscenes.NuScenes(version=dataset_version, dataroot=root_dir, verbose=True)
+            nusc = NuScenesMod(version=dataset_version, dataroot=root_dir, verbose=True)
         else:
             print(f"Could not find dataset at {root_dir} and could not automatically download specified scene.")
             exit()
@@ -57,7 +60,7 @@ def ensure_scene_available(root_dir: pathlib.Path, dataset_version: str, scene_n
         raise ValueError(f"{scene_name=} not found in dataset")
 
 
-def nuscene_sensor_names(nusc: nuscenes.NuScenes, scene_name: str) -> list[str]:
+def nuscene_sensor_names(nusc: NuScenesMod, scene_name: str) -> list[str]:
     """Return all sensor names in the scene."""
 
     sensor_names = set()
@@ -86,7 +89,7 @@ def nuscene_sensor_names(nusc: nuscenes.NuScenes, scene_name: str) -> list[str]:
     return sorted(sensor_names, key=lambda sensor_name: ordering.get(sensor_name, float("inf")))
 
 
-def log_nuscenes(nusc: nuscenes.NuScenes, scene_name: str, max_time_sec: float) -> None:
+def log_nuscenes(nusc: NuScenesMod, scene_name: str, max_time_sec: float) -> None:
     """Log nuScenes scene."""
 
     scene = next(s for s in nusc.scene if s["name"] == scene_name)
@@ -117,6 +120,7 @@ def log_nuscenes(nusc: nuscenes.NuScenes, scene_name: str, max_time_sec: float) 
 
     log_lidar_and_ego_pose(location, first_lidar_token, nusc, max_timestamp_us)
     log_cameras(first_camera_tokens, nusc, max_timestamp_us)
+    log_rendered_depth(first_camera_tokens, nusc, max_timestamp_us)
     log_radars(first_radar_tokens, nusc, max_timestamp_us)
     log_annotations(location, first_sample_token, nusc, max_timestamp_us)
 
@@ -124,7 +128,7 @@ def log_nuscenes(nusc: nuscenes.NuScenes, scene_name: str, max_time_sec: float) 
 def log_lidar_and_ego_pose(
     location: str,
     first_lidar_token: str,
-    nusc: nuscenes.NuScenes,
+    nusc: NuScenesMod,
     max_timestamp_us: float,
 ) -> None:
     """Log lidar data and vehicle pose."""
@@ -175,7 +179,7 @@ def log_lidar_and_ego_pose(
         rr.log(f"world/ego_vehicle/{sensor_name}", rr.Points3D(points, colors=point_colors))
 
 
-def log_cameras(first_camera_tokens: list[str], nusc: nuscenes.NuScenes, max_timestamp_us: float) -> None:
+def log_cameras(first_camera_tokens: list[str], nusc: NuScenesMod, max_timestamp_us: float) -> None:
     """Log camera data."""
     for first_camera_token in first_camera_tokens:
         current_camera_token = first_camera_token
@@ -190,7 +194,7 @@ def log_cameras(first_camera_tokens: list[str], nusc: nuscenes.NuScenes, max_tim
             current_camera_token = sample_data["next"]
 
 
-def log_radars(first_radar_tokens: list[str], nusc: nuscenes.NuScenes, max_timestamp_us: float) -> None:
+def log_radars(first_radar_tokens: list[str], nusc: NuScenesMod, max_timestamp_us: float) -> None:
     """Log radar data."""
     for first_radar_token in first_radar_tokens:
         current_camera_token = first_radar_token
@@ -211,10 +215,36 @@ def log_radars(first_radar_tokens: list[str], nusc: nuscenes.NuScenes, max_times
             )
             current_camera_token = sample_data["next"]
 
-# def log_depth_map(
+def log_rendered_depth(first_camera_tokens: list[str], nusc: NuScenesMod, max_timestamp_us: float) -> None:
+    CAMERA_TO_RADAR = {
+    "CAM_FRONT": "RADAR_FRONT",
+    "CAM_FRONT_LEFT": "RADAR_FRONT_LEFT",
+    "CAM_FRONT_RIGHT": "RADAR_FRONT_RIGHT",
+    "CAM_BACK_LEFT": "RADAR_BACK_LEFT",
+    "CAM_BACK_RIGHT": "RADAR_BACK_RIGHT",
+    "CAM_BACK": None  # Not available
+}
+    for first_camera_token in first_camera_tokens:
+        current_camera_token = first_camera_token
+        while current_camera_token != "":
+            sample_data = nusc.get("sample_data", current_camera_token)
+
+            if sample_data["timestamp"] > max_timestamp_us:
+                break
+
+            rr.set_time("timestamp", timestamp=sample_data["timestamp"] * 1e-6)
+
+            depth_data = nusc.get_depth_data(sample_data)
+            cam_channel = sample_data["channel"]
+            radar_channel = CAMERA_TO_RADAR.get(cam_channel, None)
+            if radar_channel is not None:
+                depth_data = filter_depth_by_radar_model( nusc, depth_data, sample_data, radar_channel=radar_channel)
+            rr.log(f"world/ego_vehicle/{sample_data['channel']}/depth", rr.DepthImage(depth_data))
+
+            current_camera_token = sample_data["next"]
 
 
-def log_annotations(location: str, first_sample_token: str, nusc: nuscenes.NuScenes, max_timestamp_us: float) -> None:
+def log_annotations(location: str, first_sample_token: str, nusc: NuScenesMod, max_timestamp_us: float) -> None:
     """Log 3D bounding boxes."""
     label2id: dict[str, int] = {}
     current_sample_token = first_sample_token
@@ -258,7 +288,7 @@ def log_annotations(location: str, first_sample_token: str, nusc: nuscenes.NuSce
     rr.log("world/anns", rr.AnnotationContext(annotation_context), static=True)
 
 
-def log_sensor_calibration(sample_data: dict[str, Any], nusc: nuscenes.NuScenes) -> None:
+def log_sensor_calibration(sample_data: dict[str, Any], nusc: NuScenesMod) -> None:
     """Log sensor calibration (pinhole camera, sensor poses, etc.)."""
     sensor_name = sample_data["channel"]
     calibrated_sensor_token = sample_data["calibrated_sensor_token"]
@@ -292,6 +322,12 @@ def main() -> None:
         type=pathlib.Path,
         default=DATASET_DIR,
         help="Root directory of nuScenes dataset",
+    ),
+    parser.add_argument(
+        "--render-dir",
+        type=pathlib.Path,
+        default=RENDER_DIR,
+        help="Root directory of nuScenes dataset",
     )
     parser.add_argument(
         "--scene-name",
@@ -313,13 +349,22 @@ def main() -> None:
 
     ensure_scene_available(args.root_dir, args.dataset_version, args.scene_name)
 
-    nusc = nuscenes.NuScenes(version=args.dataset_version, dataroot=args.root_dir, verbose=True)
+    nusc = NuScenesMod(version=args.dataset_version, dataroot=args.root_dir, render_path=args.render_dir,verbose=True)
 
     # Set up the Rerun Blueprint (how the visualization is organized):
-    sensor_views = [
+    cam_views = [
         rrb.Spatial2DView(
             name=sensor_name,
             origin=f"world/ego_vehicle/{sensor_name}",
+            contents=["$origin/**", "world/anns"],
+            overrides={"world/anns": rr.Boxes3D.from_fields(fill_mode="majorwireframe")},
+        )
+        for sensor_name in nuscene_sensor_names(nusc, args.scene_name)
+    ]
+    depth_views = [
+        rrb.Spatial2DView(
+            name=sensor_name,
+            origin=f"world/ego_vehicle/{sensor_name}/depth",
             contents=["$origin/**", "world/anns"],
             overrides={"world/anns": rr.Boxes3D.from_fields(fill_mode="majorwireframe")},
         )
@@ -335,25 +380,17 @@ def main() -> None:
                     defaults=[rr.Pinhole.from_fields(image_plane_distance=5.0)],
                     overrides={"world/anns": rr.Boxes3D.from_fields(fill_mode="solid")},
                 ),
-                rrb.Vertical(
-                    rrb.TextDocumentView(origin="description", name="Description"),
-                    rrb.MapView(
-                        origin="world",
-                        name="MapView",
-                        zoom=rrb.archetypes.MapZoom(18.0),
-                        background=rrb.archetypes.MapBackground(rrb.components.MapProvider.OpenStreetMap),
-                    ),
-                    row_shares=[1, 1],
-                ),
                 column_shares=[3, 1],
             ),
-            rrb.Grid(*sensor_views),
+            rrb.Grid(*cam_views),
+            rrb.Grid(*depth_views),
             row_shares=[4, 2],
         ),
         rrb.TimePanel(state="collapsed"),
     )
 
     rr.script_setup(args, "rerun_example_nuscenes", default_blueprint=blueprint)
+    rr.save("nuscenes_recording.rrd",default_blueprint=blueprint)
 
     rr.log(
         "description",
